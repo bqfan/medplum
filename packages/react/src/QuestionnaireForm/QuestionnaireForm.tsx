@@ -1,5 +1,5 @@
 import { Title } from '@mantine/core';
-import { ProfileResource, createReference, getReferenceString } from '@medplum/core';
+import { createReference, getReferenceString } from '@medplum/core';
 import {
   Encounter,
   Questionnaire,
@@ -8,10 +8,16 @@ import {
   QuestionnaireResponseItem,
   Reference,
 } from '@medplum/fhirtypes';
-import { useMedplum, useResource } from '@medplum/react-hooks';
-import { useCallback, useEffect, useState } from 'react';
+import { useMedplum, usePrevious, useResource } from '@medplum/react-hooks';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Form } from '../Form/Form';
-import { buildInitialResponse, getNumberOfPages, isQuestionEnabled } from '../utils/questionnaire';
+import {
+  buildInitialResponse,
+  getNumberOfPages,
+  isQuestionEnabled,
+  evaluateCalculatedExpressionsInQuestionnaire,
+  mergeUpdatedItems,
+} from '../utils/questionnaire';
 import { QuestionnaireFormContext } from './QuestionnaireForm.context';
 import { QuestionnairePageSequence } from './QuestionnaireFormComponents/QuestionnaireFormPageSequence';
 
@@ -19,6 +25,7 @@ export interface QuestionnaireFormProps {
   readonly questionnaire: Questionnaire | Reference<Questionnaire>;
   readonly subject?: Reference;
   readonly encounter?: Reference<Encounter>;
+  readonly source?: QuestionnaireResponse['source'];
   readonly disablePagination?: boolean;
   readonly excludeButtons?: boolean;
   readonly submitButtonText?: string;
@@ -28,15 +35,37 @@ export interface QuestionnaireFormProps {
 
 export function QuestionnaireForm(props: QuestionnaireFormProps): JSX.Element | null {
   const medplum = useMedplum();
-  const source = medplum.getProfile();
+  const { subject, source: sourceFromProps } = props;
   const questionnaire = useResource(props.questionnaire);
+  const prevQuestionnaire = usePrevious(questionnaire);
   const [response, setResponse] = useState<QuestionnaireResponse | undefined>();
   const [activePage, setActivePage] = useState(0);
-  const { onChange } = props;
+
+  const onChangeRef = useRef(props.onChange);
+  onChangeRef.current = props.onChange;
+
+  const onSubmitRef = useRef(props.onSubmit);
+  onSubmitRef.current = props.onSubmit;
 
   useEffect(() => {
+    // If the Questionnaire remains "the same", keep the existing response
+    if (questionnaire && getQuestionnaireIdentity(prevQuestionnaire) === getQuestionnaireIdentity(questionnaire)) {
+      return;
+    }
+
+    // throw out the existing response and start over
     setResponse(questionnaire ? buildInitialResponse(questionnaire) : undefined);
-  }, [questionnaire]);
+  }, [questionnaire, prevQuestionnaire]);
+
+  useEffect(() => {
+    if (response && onChangeRef.current) {
+      try {
+        onChangeRef.current(response);
+      } catch (e) {
+        console.error('Error invoking QuestionnaireForm.onChange callback', e);
+      }
+    }
+  }, [response]);
 
   const setItems = useCallback(
     (newResponseItems: QuestionnaireResponseItem | QuestionnaireResponseItem[]): void => {
@@ -47,28 +76,50 @@ export function QuestionnaireForm(props: QuestionnaireFormProps): JSX.Element | 
           Array.isArray(newResponseItems) ? newResponseItems : [newResponseItems]
         );
 
-        const newResponse: QuestionnaireResponse = {
+        const tempResponse: QuestionnaireResponse = {
           resourceType: 'QuestionnaireResponse',
           status: 'in-progress',
           item: mergedItems,
         };
 
-        if (onChange) {
-          try {
-            onChange(newResponse);
-          } catch (e) {
-            console.error('Error invoking QuestionnaireForm.onChange callback', e);
-          }
-        }
+        const updatedItems = evaluateCalculatedExpressionsInQuestionnaire(questionnaire?.item ?? [], tempResponse);
+        const mergedItemsWithUpdates = mergeUpdatedItems(mergedItems, updatedItems);
+
+        const newResponse: QuestionnaireResponse = {
+          resourceType: 'QuestionnaireResponse',
+          status: 'in-progress',
+          item: mergedItemsWithUpdates,
+        };
 
         return newResponse;
       });
     },
-    [onChange]
+    [questionnaire]
   );
 
+  const handleSubmit = useCallback(() => {
+    const onSubmit = onSubmitRef.current;
+    if (onSubmit && response) {
+      let source = sourceFromProps;
+      if (!source) {
+        const profile = medplum.getProfile();
+        if (profile) {
+          source = createReference(profile);
+        }
+      }
+      onSubmit({
+        ...response,
+        questionnaire: getReferenceString(questionnaire as Questionnaire),
+        subject,
+        source,
+        authored: new Date().toISOString(),
+        status: 'completed',
+      });
+    }
+  }, [medplum, questionnaire, response, subject, sourceFromProps]);
+
   function checkForQuestionEnabled(item: QuestionnaireItem): boolean {
-    return isQuestionEnabled(item, response?.item ?? []);
+    return isQuestionEnabled(item, response);
   }
 
   if (!questionnaire || !response) {
@@ -81,21 +132,7 @@ export function QuestionnaireForm(props: QuestionnaireFormProps): JSX.Element | 
 
   return (
     <QuestionnaireFormContext.Provider value={{ subject: props.subject, encounter: props.encounter }}>
-      <Form
-        testid="questionnaire-form"
-        onSubmit={() => {
-          if (props.onSubmit && response) {
-            props.onSubmit({
-              ...response,
-              questionnaire: getReferenceString(questionnaire),
-              subject: props.subject,
-              source: createReference(source as ProfileResource),
-              authored: new Date().toISOString(),
-              status: 'completed',
-            });
-          }
-        }}
-      >
+      <Form testid="questionnaire-form" onSubmit={handleSubmit}>
         {questionnaire.title && <Title>{questionnaire.title}</Title>}
         <QuestionnairePageSequence
           items={questionnaire.item ?? []}
@@ -156,4 +193,8 @@ function mergeItems(
   }
 
   return result;
+}
+
+function getQuestionnaireIdentity(questionnaire: Questionnaire | undefined): Questionnaire | string | undefined {
+  return questionnaire?.id || questionnaire;
 }

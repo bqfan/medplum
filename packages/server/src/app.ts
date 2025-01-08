@@ -1,4 +1,4 @@
-import { badRequest, ContentType } from '@medplum/core';
+import { badRequest, ContentType, warnIfNewerVersionAvailable } from '@medplum/core';
 import { OperationOutcome } from '@medplum/fhirtypes';
 import compression from 'compression';
 import cors from 'cors';
@@ -9,6 +9,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { adminRouter } from './admin/routes';
 import { asyncWrap } from './async';
+import { asyncBatchHandler } from './async-batch';
 import { authRouter } from './auth/routes';
 import { getConfig, MedplumServerConfig } from './config';
 import {
@@ -34,6 +35,7 @@ import { cleanupHeartbeat, initHeartbeat } from './heartbeat';
 import { hl7BodyParser } from './hl7/parser';
 import { keyValueRouter } from './keyvalue/routes';
 import { initKeys } from './oauth/keys';
+import { authenticateRequest } from './oauth/middleware';
 import { oauthRouter } from './oauth/routes';
 import { openApiHandler } from './openapi';
 import { closeRateLimiter, getRateLimiter } from './ratelimit';
@@ -46,6 +48,8 @@ import { wellKnownRouter } from './wellknown';
 import { closeWorkers, initWorkers } from './workers';
 
 let server: http.Server | undefined = undefined;
+
+export const JSON_TYPE = [ContentType.JSON, 'application/*+json'];
 
 /**
  * Sets standard headers for all requests.
@@ -138,9 +142,11 @@ function errorHandler(err: any, req: Request, res: Response, next: NextFunction)
   res.status(500).json({ msg: 'Internal Server Error' });
 }
 
-export const JSON_TYPE = [ContentType.JSON, 'application/*+json'];
-
 export async function initApp(app: Express, config: MedplumServerConfig): Promise<http.Server> {
+  if (process.env.NODE_ENV !== 'test') {
+    await warnIfNewerVersionAvailable('server', { base: config.baseUrl });
+  }
+
   await initAppServices(config);
   server = http.createServer(app);
   initWebSockets(server);
@@ -154,6 +160,10 @@ export async function initApp(app: Express, config: MedplumServerConfig): Promis
   app.use(attachRequestContext);
   app.use(getRateLimiter(config));
   app.use('/fhir/R4/Binary', binaryRouter);
+
+  // Handle async batch by enqueueing job
+  app.post('/fhir/R4', authenticateRequest, asyncWrap(asyncBatchHandler(config)));
+
   app.use(
     urlencoded({
       extended: false,
@@ -264,3 +274,13 @@ const loggingMiddleware = (req: Request, res: Response, next: NextFunction): voi
 
   next();
 };
+
+export async function runMiddleware(
+  req: Request,
+  res: Response,
+  handler: (req: Request, res: Response, next: (err?: any) => void) => void
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    handler(req, res, (err) => (err ? reject(err) : resolve()));
+  });
+}

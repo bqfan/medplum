@@ -169,6 +169,10 @@ function formatTsquery(filter: string | undefined): string | undefined {
   return noPunctuation.replace(/\s+/g, ':* & ') + ':*';
 }
 
+export interface Expression {
+  buildSql(builder: SqlBuilder): void;
+}
+
 export class Column implements Expression {
   constructor(
     readonly tableName: string | undefined,
@@ -182,16 +186,12 @@ export class Column implements Expression {
   }
 }
 
-export class Literal implements Expression {
+export class Parameter implements Expression {
   constructor(readonly value: string) {}
 
   buildSql(sql: SqlBuilder): void {
-    sql.append(this.value);
+    sql.param(this.value);
   }
-}
-
-export interface Expression {
-  buildSql(builder: SqlBuilder): void;
 }
 
 export class Negation implements Expression {
@@ -445,9 +445,10 @@ export function normalizeDatabaseError(err: any): OperationOutcomeError {
       return new OperationOutcomeError(conflict(err.detail));
     case '40001': // serialization_failure
       // Transaction rollback due to serialization error -> 409 Conflict
-      return new OperationOutcomeError(conflict(err.message));
+      return new OperationOutcomeError(conflict(err.message, err.code));
     case '57014': // query_canceled
       // Statement timeout -> 504 Gateway Timeout
+      getLogger().warn('Database statement timeout', { error: err.message, stack: err.stack, code: err.code });
       return new OperationOutcomeError(serverTimeout(err.message));
   }
 
@@ -495,7 +496,7 @@ interface CTE {
 export class SelectQuery extends BaseQuery implements Expression {
   readonly innerQuery?: SelectQuery | Union | ValuesQuery;
   readonly distinctOns: Column[];
-  readonly columns: (Column | Literal)[];
+  readonly columns: Column[];
   readonly joins: Join[];
   readonly groupBys: GroupBy[];
   readonly orderBys: OrderBy[];
@@ -531,8 +532,8 @@ export class SelectQuery extends BaseQuery implements Expression {
     return this;
   }
 
-  column(column: Column | string | Literal): this {
-    this.columns.push(column instanceof Literal ? column : getColumn(column, this.tableName));
+  column(column: Column | string): this {
+    this.columns.push(getColumn(column, this.tableName));
     return this;
   }
 
@@ -635,18 +636,16 @@ export class SelectQuery extends BaseQuery implements Expression {
 
   private buildColumns(sql: SqlBuilder): void {
     if (this.columns.length === 0) {
-      throw new Error('No columns selected');
+      sql.append('1');
+      return;
     }
+
     let first = true;
     for (const column of this.columns) {
       if (!first) {
         sql.append(', ');
       }
-      if (column instanceof Literal) {
-        sql.appendParameters(column.value, false);
-      } else {
-        sql.appendColumn(column);
-      }
+      sql.appendColumn(column);
       first = false;
     }
   }

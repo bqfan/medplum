@@ -1,9 +1,10 @@
-import { splitN } from '@medplum/core';
+import { concatUrls, splitN } from '@medplum/core';
 import { KeepJobs } from 'bullmq';
 import { mkdtempSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { loadAwsConfig } from './cloud/aws/config';
+import { loadGcpConfig } from './cloud/gcp/config';
 
 const DEFAULT_AWS_REGION = 'us-east-1';
 
@@ -19,9 +20,9 @@ export interface MedplumServerConfig {
   logLevel?: string;
   binaryStorage?: string;
   storageBaseUrl: string;
-  signingKey: string;
-  signingKeyId: string;
-  signingKeyPassphrase: string;
+  signingKey?: string;
+  signingKeyId?: string;
+  signingKeyPassphrase?: string;
   supportEmail: string;
   approvedSenderEmails?: string;
   database: MedplumDatabaseConfig;
@@ -37,6 +38,7 @@ export interface MedplumServerConfig {
   recaptchaSiteKey?: string;
   recaptchaSecretKey?: string;
   maxJsonSize: string;
+  maxBatchSize: string;
   allowedOrigins?: string;
   awsRegion: string;
   botLambdaRoleArn: string;
@@ -173,6 +175,9 @@ export async function loadConfig(configName: string): Promise<MedplumServerConfi
     case 'aws':
       cachedConfig = await loadAwsConfig(configPath);
       break;
+    case 'gcp':
+      cachedConfig = await loadGcpConfig(configPath);
+      break;
     default:
       throw new Error('Unrecognized config type: ' + configType);
   }
@@ -269,12 +274,13 @@ async function loadFileConfig(path: string): Promise<MedplumServerConfig> {
 function addDefaults(config: MedplumServerConfig): MedplumServerConfig {
   config.port = config.port || 8103;
   config.issuer = config.issuer || config.baseUrl;
-  config.jwksUrl = config.jwksUrl || config.baseUrl + '/.well-known/jwks.json';
-  config.authorizeUrl = config.authorizeUrl || config.baseUrl + '/authorize';
-  config.tokenUrl = config.tokenUrl || config.baseUrl + '/token';
-  config.userInfoUrl = config.userInfoUrl || config.baseUrl + '/userinfo';
-  config.storageBaseUrl = config.storageBaseUrl || config.baseUrl + '/storage';
+  config.jwksUrl = config.jwksUrl || concatUrls(config.baseUrl, '/.well-known/jwks.json');
+  config.authorizeUrl = config.authorizeUrl || concatUrls(config.baseUrl, '/oauth2/authorize');
+  config.tokenUrl = config.tokenUrl || concatUrls(config.baseUrl, '/oauth2/token');
+  config.userInfoUrl = config.userInfoUrl || concatUrls(config.baseUrl, '/oauth2/userinfo');
+  config.storageBaseUrl = config.storageBaseUrl || concatUrls(config.baseUrl, '/storage');
   config.maxJsonSize = config.maxJsonSize || '1mb';
+  config.maxBatchSize = config.maxBatchSize || '50mb';
   config.awsRegion = config.awsRegion || DEFAULT_AWS_REGION;
   config.botLambdaLayerName = config.botLambdaLayerName || 'medplum-bot-layer';
   config.bcryptHashSalt = config.bcryptHashSalt || 10;

@@ -5,12 +5,14 @@ import {
   Filter,
   getDateProperty,
   getReferenceString,
+  isString,
   MEDPLUM_CLI_CLIENT_ID,
   OperationOutcomeError,
   Operator,
   ProfileResource,
   resolveId,
   tooManyRequests,
+  unauthorized,
 } from '@medplum/core';
 import {
   AccessPolicy,
@@ -25,15 +27,22 @@ import {
   User,
 } from '@medplum/fhirtypes';
 import bcrypt from 'bcryptjs';
+import { IncomingMessage } from 'http';
 import { JWTPayload, jwtVerify, VerifyOptions } from 'jose';
 import fetch from 'node-fetch';
 import assert from 'node:assert/strict';
 import { timingSafeEqual } from 'node:crypto';
 import { authenticator } from 'otplib';
 import { getLogger } from '../context';
-import { getAccessPolicyForLogin } from '../fhir/accesspolicy';
+import { getAccessPolicyForLogin, getRepoForLogin } from '../fhir/accesspolicy';
 import { getSystemRepo } from '../fhir/repo';
-import { AuditEventOutcome, logAuthEvent, LoginEvent } from '../util/auditevent';
+import {
+  AuditEventOutcome,
+  createAuditEvent,
+  logAuditEvent,
+  LoginEvent,
+  UserAuthenticationEvent,
+} from '../util/auditevent';
 import {
   generateAccessToken,
   generateIdToken,
@@ -397,6 +406,10 @@ export async function setLoginMembership(login: Login, membershipId: string): Pr
     throw new OperationOutcomeError(badRequest('Invalid profile'));
   }
 
+  if (membership.active === false) {
+    throw new OperationOutcomeError(badRequest('Profile not active'));
+  }
+
   // Get the project
   const project = await systemRepo.readReference<Project>(membership.project as Reference<Project>);
 
@@ -415,7 +428,15 @@ export async function setLoginMembership(login: Login, membershipId: string): Pr
   // Check IP Access Rules
   await checkIpAccessRules(login, accessPolicy);
 
-  logAuthEvent(LoginEvent, project.id as string, membership.profile, login.remoteAddress, AuditEventOutcome.Success);
+  const auditEvent = createAuditEvent(
+    UserAuthenticationEvent,
+    LoginEvent,
+    project.id as string,
+    membership.profile,
+    login.remoteAddress,
+    AuditEventOutcome.Success
+  );
+  logAuditEvent(auditEvent);
 
   // Everything checks out, update the login
   const updatedLogin: Login = {
@@ -808,10 +829,15 @@ export async function verifyMultipleMatchingException(
 
 /**
  * Verifies the access token and returns the corresponding login, membership, and project.
+ * Handles "on behalf of" requests if the "x-medplum-on-behalf-of" header is present.
+ * @param req - The incoming HTTP request.
  * @param accessToken - The access token as provided by the client.
  * @returns On success, returns the login, membership, and project. On failure, throws an error.
  */
-export async function getLoginForAccessToken(accessToken: string): Promise<AuthState | undefined> {
+export async function getLoginForAccessToken(
+  req: IncomingMessage | undefined,
+  accessToken: string
+): Promise<AuthState | undefined> {
   let verifyResult: Awaited<ReturnType<typeof verifyJwt>>;
   try {
     verifyResult = await verifyJwt(accessToken);
@@ -835,5 +861,90 @@ export async function getLoginForAccessToken(accessToken: string): Promise<AuthS
 
   const membership = await systemRepo.readReference<ProjectMembership>(login.membership);
   const project = await systemRepo.readReference<Project>(membership.project as Reference<Project>);
-  return { login, membership, project, accessToken };
+  const authState = { login, project, membership };
+  await tryAddOnBehalfOf(req, authState);
+  return authState;
+}
+
+/**
+ * Verifies the basic auth token and returns the corresponding login, membership, and project.
+ * Handles "on behalf of" requests if the "x-medplum-on-behalf-of" header is present.
+ * @param req - The incoming HTTP request.
+ * @param token - The basic auth token as provided by the client.
+ * @returns On success, returns the login, membership, and project. On failure, throws an error.
+ */
+export async function getLoginForBasicAuth(req: IncomingMessage, token: string): Promise<AuthState | undefined> {
+  const credentials = Buffer.from(token, 'base64').toString('ascii');
+  const [username, password] = credentials.split(':');
+  if (!username || !password) {
+    return undefined;
+  }
+
+  const systemRepo = getSystemRepo();
+  let client: ClientApplication;
+  try {
+    client = await systemRepo.readResource<ClientApplication>('ClientApplication', username);
+  } catch (_err) {
+    return undefined;
+  }
+
+  if (!timingSafeEqualStr(client.secret as string, password)) {
+    return undefined;
+  }
+
+  const membership = await getClientApplicationMembership(client);
+  if (!membership) {
+    return undefined;
+  }
+
+  const project = await systemRepo.readReference<Project>(membership.project as Reference<Project>);
+  const login: Login = {
+    resourceType: 'Login',
+    user: createReference(client),
+    authMethod: 'client',
+    authTime: new Date().toISOString(),
+  };
+
+  const authState = { login, project, membership };
+  await tryAddOnBehalfOf(req, authState);
+  return authState;
+}
+
+/**
+ * Tries to add the "on behalf of" user to the auth state.
+ * @param req - The incoming HTTP request.
+ * @param authState - The existing auth state.
+ */
+async function tryAddOnBehalfOf(req: IncomingMessage | undefined, authState: AuthState): Promise<void> {
+  const onBehalfOfHeader = req?.headers?.['x-medplum-on-behalf-of'];
+  if (!onBehalfOfHeader || !isString(onBehalfOfHeader)) {
+    return;
+  }
+
+  if (!authState.membership.admin) {
+    throw new OperationOutcomeError(unauthorized);
+  }
+
+  let onBehalfOfMembership: ProjectMembership | undefined = undefined;
+
+  const adminRepo = await getRepoForLogin(authState);
+
+  if (onBehalfOfHeader.startsWith('ProjectMembership/')) {
+    onBehalfOfMembership = await adminRepo.readReference<ProjectMembership>({ reference: onBehalfOfHeader });
+  } else {
+    onBehalfOfMembership = await adminRepo.searchOne({
+      resourceType: 'ProjectMembership',
+      filters: [
+        { code: 'profile', operator: Operator.EQUALS, value: onBehalfOfHeader },
+        { code: 'project', operator: Operator.EQUALS, value: getReferenceString(authState.project) },
+      ],
+    });
+    if (!onBehalfOfMembership) {
+      throw new OperationOutcomeError(unauthorized);
+    }
+  }
+
+  const onBehalfOf = await adminRepo.readReference(onBehalfOfMembership.profile as Reference<ProfileResource>);
+  authState.onBehalfOf = onBehalfOf;
+  authState.onBehalfOfMembership = onBehalfOfMembership;
 }

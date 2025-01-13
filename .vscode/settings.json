@@ -21,5 +21,28 @@
   "editor.codeActionsOnSave": {
     "source.fixAll.eslint": "never"
   },
-  "cSpell.words": ["Medplum", "FHIR"]
+  "cSpell.words": [
+    "Medplum",
+    "FHIR"
+  ],
+  "workbench.colorCustomizations": {
+    "activityBar.activeBackground": "#b79bfb",
+    "activityBar.background": "#b79bfb",
+    "activityBar.foreground": "#15202b",
+    "activityBar.inactiveForeground": "#15202b99",
+    "activityBarBadge.background": "#b83b07",
+    "activityBarBadge.foreground": "#e7e7e7",
+    "commandCenter.border": "#15202b99",
+    "sash.hoverBorder": "#b79bfb",
+    "statusBar.background": "#946af9",
+    "statusBar.foreground": "#15202b",
+    "statusBarItem.hoverBackground": "#7139f7",
+    "statusBarItem.remoteBackground": "#946af9",
+    "statusBarItem.remoteForeground": "#15202b",
+    "titleBar.activeBackground": "#946af9",
+    "titleBar.activeForeground": "#15202b",
+    "titleBar.inactiveBackground": "#946af999",
+    "titleBar.inactiveForeground": "#15202b99"
+  },
+  "peacock.color": "#946af9"
 }
